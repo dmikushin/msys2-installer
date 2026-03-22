@@ -74,6 +74,69 @@ create_installer() {
   popd > /dev/null
 }
 
+build_custom_packages() {
+  echo "[Building custom packages...]"
+  local _custom_pkgs="${_build}/custom-packages"
+  rm -Rf "${_custom_pkgs}" && mkdir -p "${_custom_pkgs}"
+
+  # Build each PKGBUILD found in packages/
+  for _pkgdir in "${_thisdir}"/packages/*/; do
+    [ -f "${_pkgdir}/PKGBUILD" ] || continue
+    local _pkgname=$(basename "${_pkgdir}")
+    echo "  -> Building ${_pkgname}..."
+    pushd "${_pkgdir}" > /dev/null
+      PKGDEST="${_custom_pkgs}" makepkg -sf --noconfirm
+    popd > /dev/null
+  done
+}
+
+create_custom_repo() {
+  echo "[Creating custom package repository...]"
+  local _custom_repo="${_build}/custom-repo"
+  local _custom_pkgs="${_build}/custom-packages"
+  rm -Rf "${_custom_repo}" && mkdir -p "${_custom_repo}"
+
+  # Copy all built packages into the repo directory
+  cp "${_custom_pkgs}"/*.pkg.tar.* "${_custom_repo}/" 2>/dev/null || true
+
+  # Also include any pre-built packages placed directly in packages/
+  cp "${_thisdir}"/packages/*.pkg.tar.* "${_custom_repo}/" 2>/dev/null || true
+
+  local _pkg_count=$(ls -1 "${_custom_repo}"/*.pkg.tar.* 2>/dev/null | wc -l)
+  if [ "${_pkg_count}" -eq 0 ]; then
+    echo "  -> No custom packages found, skipping."
+    return 1
+  fi
+
+  # Create pacman repository database
+  repo-add "${_custom_repo}/custom.db.tar.gz" "${_custom_repo}"/*.pkg.tar.*
+  echo "  -> Repository created with ${_pkg_count} package(s)."
+}
+
+install_custom_packages() {
+  echo "[Installing custom packages into chroot...]"
+  local _custom_repo="${_build}/custom-repo"
+  local _chroot_conf="${_newmsys}/etc/pacman.conf"
+
+  # Append custom repo to the chroot's pacman.conf
+  local _repo_path
+  _repo_path=$(cygpath -m "${_custom_repo}" 2>/dev/null || echo "${_custom_repo}")
+  echo "" >> "${_chroot_conf}"
+  echo "[custom]" >> "${_chroot_conf}"
+  echo "SigLevel = Never" >> "${_chroot_conf}"
+  echo "Server = file:///${_repo_path}" >> "${_chroot_conf}"
+
+  # Sync and install all custom packages
+  pacman -Sy --noconfirm --root "${_newmsys}" --config "${_chroot_conf}"
+  for _pkg in "${_custom_repo}"/*.pkg.tar.*; do
+    [ -f "${_pkg}" ] || continue
+    local _pkgname
+    _pkgname=$(basename "${_pkg}" | sed 's/-[0-9].*//')
+    echo "  -> Installing ${_pkgname}..."
+    pacman -S "${_pkgname}" --noconfirm --root "${_newmsys}" --config "${_chroot_conf}"
+  done
+}
+
 create_chroot_system() {
   echo "[Creating chroot system...]"
   rm -Rf "${_newmsysbase}" && mkdir -p "${_newmsys}"
@@ -86,6 +149,12 @@ create_chroot_system() {
     pacman -Syu --root "${_newmsys}"
     pacman -S filesystem msys2-runtime --noconfirm --root "${_newmsys}"
     pacman -S base --noconfirm --root "${_newmsys}"
+
+    # Install custom packages (sillybear, etc.) if available
+    if create_custom_repo; then
+      install_custom_packages
+    fi
+
     pacman -Q --root "${_newmsys}" > "${_thisdir}/msys2-base-${_arch_name}-${_date}.packages.txt"
   popd > /dev/null
 }
@@ -97,6 +166,9 @@ main() {
     "${MINGW_PACKAGE_PREFIX}-xz" \
     "${MINGW_PACKAGE_PREFIX}-zstd" \
     "tar"
+
+  # Build custom packages from packages/*/PKGBUILD (if any)
+  build_custom_packages
 
   create_chroot_system
 
