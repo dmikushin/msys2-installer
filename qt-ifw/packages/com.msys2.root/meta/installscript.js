@@ -43,7 +43,9 @@ function createShortcuts()
     component.addOperation( "Execute",
                            ["@TargetDir@\\usr\\bin\\bash.exe", "--login", "-c", "exit"]);
 
-    // Generate sillybear host keys (does not require admin rights)
+    // Initialize sillybear SSH server: generate host keys and register
+    // as a Windows service. The installer is already elevated (UAC) since
+    // it writes to C:\msys64, so cygrunsrv has the required admin rights.
     component.addOperation( "Execute",
                            ["@TargetDir@\\usr\\bin\\bash.exe", "--login", "-c",
                             "if command -v sillybearkey >/dev/null 2>&1; then " +
@@ -51,7 +53,12 @@ function createShortcuts()
                             "for kt in rsa ecdsa ed25519; do " +
                             "kf=/etc/sillybear/sillybear_${kt}_host_key; " +
                             "[ -f $kf ] || sillybearkey -t $kt -f $kf; " +
-                            "done; fi"]);
+                            "done; " +
+                            "if command -v cygrunsrv >/dev/null 2>&1; then " +
+                            "cygrunsrv -Q sillybear >/dev/null 2>&1 || " +
+                            "cygrunsrv -I sillybear -d 'Sillybear SSH Server' -p /usr/bin/sillybear -a '-F' -y tcpip; " +
+                            "cygrunsrv -S sillybear || true; " +
+                            "fi; fi"]);
 }
 
 function Component() {
