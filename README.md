@@ -1,33 +1,194 @@
 # mkinstaller: branded MSYS2 installers for commercial products
 
-`mkinstaller` turns the MSYS2 installer into a constructor for product
-installers. A product is a set of pacman packages; the installer puts a
-standard MSYS2 environment into the product's own folder, installs the
-product packages into it with MSYS2's own pacman, and gives the user a
-product terminal. Updates come through pacman from a GitHub repository, and
-the licence is the SSH key that grants read access to it.
+`mkinstaller` builds Windows installers for products that ship as pacman
+packages on top of [MSYS2](https://www.msys2.org). It is a fork of the
+[MSYS2 installer](https://github.com/msys2/msys2-installer): the same Qt
+Installer Framework installer and the same official MSYS2 base system, but
+configured by one `product.toml` instead of being MSYS2 itself.
 
-What an installer built from `examples/hello/product.toml` does:
+An installer built by `mkinstaller`:
 
-* installs into `C:\AcmeHello` (not `C:\msys64`), registered as "Acme Hello"
+* installs a standard MSYS2 environment into the product's own folder, e.g.
+  `C:\AcmeHello` instead of `C:\msys64`, registered under the product's name
   with its own uninstaller;
-* creates "Acme Hello Terminal" on the desktop and in the start menu: a mintty
-  window titled "Acme Hello Terminal" with the product icon, started by
-  `acme-hello.exe` (the MSYS2 launcher built with the product's name and icon);
-* installs `acme-hello` and its dependencies with the target's pacman, so
-  install scriptlets and hooks run as on any MSYS2 system;
-* asks for the licence key file and installs it; `pacman -Syu` then fetches
-  product updates over `git+ssh` with that key.
+* shows the product's skin (icons, logo, banner, colours) and licence;
+* creates a branded terminal shortcut on the desktop and in the start menu:
+  a mintty window with the product's title and icon, started by a launcher
+  `.exe` built from MSYS2's launcher with the product's name;
+* installs the product's pacman packages and their dependencies with the
+  target's own pacman, so install scriptlets and hooks run as on any MSYS2
+  system;
+* takes a licence key file and installs it. The licence is a read-only
+  GitHub deploy key: with it, pacman fetches product updates from a private
+  GitHub repository over `git+ssh`; without it, the update channel refuses.
 
-## Building an installer
+Product updates are ordinary pacman updates: the vendor runs
+`mkinstaller publish`, the customer runs `pacman -Syu` (or
+`pacman -Sy <package>`) in the product terminal.
 
-    ./mkinstaller build examples/hello/product.toml
+## Step-by-step: setting up a product
 
-Requirements on the Linux build host: `pacman` (with `repo-add`, `pacman-key`),
-`unshare` (util-linux), `bsdtar`, `7z`, `git`, `ssh`,
-`x86_64-w64-mingw32-gcc`/`windres`, `wine`, `gpg`, Python 3.11+.
+The commands below set up a product "Acme Hello" (id `acme-hello`) with the
+update channel `acme/hello-dist` on GitHub. Replace the names with yours.
 
-Steps, all on the build host:
+### 1. Prepare the build host
+
+The build host is Linux. On Arch Linux and derivatives (the tested setup):
+
+    sudo pacman -S --needed pacman util-linux libarchive 7zip git openssh \
+        mingw-w64-gcc mingw-w64-binutils wine gnupg python
+
+Other distributions need the same tools: pacman 6 with `repo-add` and
+`pacman-key`, `unshare`, `bsdtar`, `7z`, `x86_64-w64-mingw32-gcc` and
+`-windres`, `wine`, `gpg`, Python 3.11+.
+
+wine must be able to run MSYS2 programs. Releases up to at least 11.22 break
+every fork+exec of MSYS2 programs; build wine with
+`tests/wine/grow-thread-stack-rw.patch` (backport of upstream commit
+17e0faed) or use a release that contains that commit. `tests/wine/README.md`
+has a small reproducer (`stackprobe.c`) to check a wine build. wine is needed only to run
+Qt IFW's `binarycreator.exe` and the acceptance test; the installers
+themselves are for Windows.
+
+Get the constructor:
+
+    git clone -b constructor https://github.com/dmikushin/msys2-installer.git
+    cd msys2-installer
+
+### 2. Package the product
+
+Each part of the product is a pacman package built for MSYS2: a `PKGBUILD`
+with `arch=('any')` for scripts and data, or one built in MSYS2 for binaries.
+`examples/hello/pkg/PKGBUILD` is a minimal one, with a dependency (`tree`
+from MSYS2) and an install scriptlet:
+
+    cd examples/hello/pkg
+    HELLO_VERSION=1.0.0 PKGDEST=$PWD/../dist makepkg --nodeps
+    cd -
+
+Dependencies on MSYS2 packages are resolved against the MSYS2 repositories
+at build time. They must not require newer MSYS2 core packages (`bash`,
+`filesystem`, `mintty`, `msys2-runtime`, `pacman`, `pacman-mirrors`) than
+the base archive contains; the build stops with a message if they do. Take a
+newer base archive in that case.
+
+### 3. Create the update channel on GitHub
+
+1. Create a **private** repository for the releases, e.g. `acme/hello-dist`.
+   It holds only release commits; keep the sources elsewhere.
+2. Create the vendor's publishing key and add it as a deploy key **with**
+   write access:
+
+       ssh-keygen -t ed25519 -N '' -f publisher.key -C acme-hello-publisher
+       gh repo deploy-key add publisher.key.pub -R acme/hello-dist -t publisher --allow-write
+
+3. Create a build key: a read-only deploy key that the build uses to fetch
+   the product packages from the channel:
+
+       ssh-keygen -t ed25519 -N '' -f build.key -C acme-hello-build
+       gh repo deploy-key add build.key.pub -R acme/hello-dist -t build
+
+Deploy keys can also be added on GitHub under *Settings, Deploy keys*. Note
+that `gh` ties the keys it adds to its authentication token: if that token
+is revoked, GitHub removes those deploy keys too, and with them the
+customers' licences. For licences that must outlive a token, add the keys in
+the web interface or with a token that stays.
+
+### 4. Publish the first release
+
+    ./mkinstaller publish examples/hello/product.toml examples/hello/dist v1.0.0 \
+        --push-key publisher.key
+
+This builds a pacman repository named after `channel.name` from all packages
+in the directory, commits it, tags it `v1.0.0` and points the branch
+`channel.ref` (`stable`) at it. Each release replaces the branch content;
+older releases stay reachable by their tags.
+
+### 5. Write `product.toml`
+
+Copy `examples/hello/` and edit `product.toml`; every key is explained in
+[Configuration](#configuration). The parts that matter first:
+
+    [product]
+    id = "acme-hello"
+    name = "Acme Hello"
+    version = "1.0.0"
+    publisher = "Acme Corp"
+
+    [install]
+    default_dir = "@RootDir@AcmeHello"     # no spaces
+
+    [terminal]
+    name = "Acme Hello Terminal"
+    icon = "assets/acme.ico"
+
+    [license]
+    file = "LICENSE.txt"
+
+    [packages]
+    lists = ["packages.txt"]               # acme-hello, one name per line
+
+    [channel]
+    name = "acme"
+    remote = "ssh://git@github.com/acme/hello-dist.git"
+    build_key = "${ACME_BUILD_KEY}"
+
+Skin images go to `[branding]`: `logo` (shown in the banner corner),
+`banner` (page header), `watermark`, `background`, `installer_icon`, and
+`title_color` for the page titles.
+
+### 6. Build the installer
+
+    ACME_BUILD_KEY=$PWD/build.key ./mkinstaller build examples/hello/product.toml
+
+The installer is written to `examples/hello/out/acme-hello-1.0.0-setup.exe`;
+the work tree is `examples/hello/_build/`, downloads are cached in
+`~/.cache/mkinstaller/`. Pass `--wine /path/to/wine` to use a patched wine.
+
+### 7. Issue a licence
+
+Per customer, one read-only deploy key:
+
+    ssh-keygen -t ed25519 -N '' -f customer-42.key -C acme-hello-customer-42
+    gh repo deploy-key add customer-42.key.pub -R acme/hello-dist -t customer-42
+
+Send the customer `customer-42.key` (the private half) together with the
+installer. Revoke the licence by deleting the deploy key:
+
+    gh repo deploy-key list -R acme/hello-dist
+    gh repo deploy-key delete <id> -R acme/hello-dist
+
+### 8. Install (customer)
+
+Run the installer and choose `customer-42.key` on the *Licence key* page,
+or install unattended:
+
+    acme-hello-1.0.0-setup.exe install --confirm-command --accept-messages --accept-licenses LicenseKeyFile=C:\path\customer-42.key
+
+Without a key the product installs too; updates stay disabled until the key
+is copied to `<install dir>\etc\pacman.d\git-xfer\acme.key`.
+
+### 9. Ship an update
+
+Build the new package version, then publish it:
+
+    ./mkinstaller publish examples/hello/product.toml dist-1.1.0 v1.1.0 --push-key publisher.key
+
+The directory must contain every package of the release, not only the
+changed ones: a release is a complete repository. Customers get it with
+`pacman -Syu` in the product terminal. A new installer is only needed for new
+customers; rebuild it when the release should be in the initial install.
+
+### 10. Check the result
+
+    WINE=/path/to/patched/wine tests/acceptance.sh
+
+runs steps 2 to 9 with the example product in a fresh wine prefix and
+checks the outcome (see [Acceptance test](#acceptance-test)).
+
+## How a build works
+
+All steps run on the build host:
 
 1. Download the official MSYS2 base archive pinned in `[base]` and verify its
    sha256. The packages must not need newer MSYS2 core packages (pacman,
@@ -118,14 +279,23 @@ unattended:
 
 ## Acceptance test
 
-    WINE=/path/to/wine tests/acceptance.sh
+    WINE=/path/to/wine tests/acceptance.sh [--remote URL --licence KEY --publisher KEY --known-hosts FILE]
 
-builds the example product, installs it in a fresh wine prefix, checks path,
-launcher, shortcuts, packages and scriptlets, publishes 1.1.0 and checks that
-`pacman -Syu` installs it, and that without the licence key the channel
-refuses. By default a local sshd (`tests/channel-fixture.sh`) with a read-only
-licence key plays the GitHub repository; `--remote/--licence/--publisher`
-point it at a real one.
+builds the example product (versions 1.0.0 and 1.1.0), publishes 1.0.0,
+builds the installer, installs it unattended with the licence key in a fresh
+wine prefix and checks: install folder, launcher and its icon and title,
+desktop and start-menu shortcuts, uninstaller, licence key, pacman
+configuration, installed packages, dependency marking, the install
+scriptlet. It then publishes 1.1.0 and checks that `pacman -Qu` offers it
+and `pacman -S` installs it over git+ssh, and that without the licence key
+`pacman -Sy` fails and names the missing key. The test updates only the
+product package: a full `-Syu` would also pull whatever MSYS2 released since
+the base archive and make the result depend on the day.
 
-wine releases up to 11.22 break every fork+exec of MSYS2 programs; see
-`tests/wine/README.md` for the cause and the patch.
+By default a local sshd (`tests/channel-fixture.sh`) plays GitHub, with a
+read-only licence key and a read-write publisher key; `--remote` and the key
+options run it against a real repository. Logs go to
+`$WORK/logs` (default `~/scratch/mkinstaller-accept`).
+
+`tests/wine/README.md` documents the two defects found while running MSYS2
+under wine, with reproducers.
