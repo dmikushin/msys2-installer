@@ -1,0 +1,4 @@
+ACME HELLO END USER LICENSE AGREEMENT
+
+This is the example licence of the mkinstaller test product. It grants no
+rights; it only demonstrates the licence page of the installer.

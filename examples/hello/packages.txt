@@ -1,0 +1,2 @@
+# Packages the installer delivers (one per line; dependencies are resolved).
+acme-hello

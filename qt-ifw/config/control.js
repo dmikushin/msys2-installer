@@ -1,6 +1,8 @@
 function Controller()
 {
-  installer.setDefaultPageVisible(QInstaller.LicenseCheck, false);
+  if (!@HAS_LICENSE@) {
+    installer.setDefaultPageVisible(QInstaller.LicenseCheck, false);
+  }
   if (installer.isInstaller()) {
     installer.setDefaultPageVisible(QInstaller.ComponentSelection, false);
     installer.setDefaultPageVisible(QInstaller.ReadyForInstallation, false);

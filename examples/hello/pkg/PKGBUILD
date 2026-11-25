@@ -1,0 +1,18 @@
+# Test product package. Build with: HELLO_VERSION=1.0.0 makepkg --nodeps
+pkgname=acme-hello
+pkgver=${HELLO_VERSION:-1.0.0}
+pkgrel=1
+pkgdesc="Acme Hello: the product payload of the mkinstaller example"
+arch=('any')
+license=('LicenseRef-Acme-EULA')
+depends=('tree')
+install=acme-hello.install
+
+package() {
+  install -d "$pkgdir/usr/bin"
+  cat > "$pkgdir/usr/bin/acme-hello" <<EOF
+#!/usr/bin/bash
+echo "Acme Hello $pkgver"
+EOF
+  chmod 755 "$pkgdir/usr/bin/acme-hello"
+}

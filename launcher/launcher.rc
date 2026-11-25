@@ -1,5 +1,6 @@
 #include "macros.h"
 #include "version.h"
+#include "product.h"
 
 1 VERSIONINFO
 FILEVERSION     VER_MAJOR,VER_MINOR,0,0
@@ -8,8 +9,8 @@ BEGIN
 	BEGIN
 		BLOCK "040904E4"
 		BEGIN
-			VALUE "ProductName", "MSYS2"
-			VALUE "FileDescription", "MSYS2 " STRINGIFY_A(MSYSTEM) " shell launcher"
+			VALUE "ProductName", PRODUCT_NAME_A
+			VALUE "FileDescription", PRODUCT_TITLE_A
 			VALUE "FileVersion", STRINGIFY_A(VER_MAJOR) "." STRINGIFY_A(VER_MINOR)
 		END
 	END
@@ -20,4 +21,4 @@ BEGIN
 	END
 END
 
-id ICON STRINGIFY_A(ICONFILE)
+id ICON "launcher.ico"

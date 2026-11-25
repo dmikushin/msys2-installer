@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# pacman XferCommand that adds a git+ssh:// transport to pacman.
+#
+#   XferCommand = /usr/bin/bash /usr/bin/pacman-git-xfer %o %u
+#
+# A repository is published as a git ref (a branch or a tag) whose tree holds
+# the pacman repository files: <repo>.db, <repo>.files and the packages.
+# The pacman.conf server line names the remote and the ref after '#':
+#
+#   Server = git+ssh://git@github.com/acme/hello-dist.git#stable
+#
+# pacman then asks for git+ssh://git@github.com/acme/hello-dist.git#stable/acme.db,
+# and this script answers it with a shallow fetch of that ref over SSH, using the
+# private key (the product licence) that the config file assigns to the remote.
+# Every other URL scheme goes to curl, as pacman's built-in downloader would.
+#
+# Config file (PACMAN_GIT_XFER_CONF, default /etc/pacman.d/git-xfer.conf), one
+# remote per line:   <remote-url> <private-key-file> [<known-hosts-file>]
+# Cache (PACMAN_GIT_XFER_CACHE, default /var/cache/pacman/git-xfer): one shallow
+# bare repository per remote.
+set -euo pipefail
+
+me=pacman-git-xfer
+out=${1:?usage: $me <output-file> <url>}
+url=${2:?usage: $me <output-file> <url>}
+conf=${PACMAN_GIT_XFER_CONF:-/etc/pacman.d/git-xfer.conf}
+cache=${PACMAN_GIT_XFER_CACHE:-/var/cache/pacman/git-xfer}
+
+case "$url" in
+  git+ssh://*) ;;
+  *) exec curl --fail --location --continue-at - --output "$out" "$url" ;;
+esac
+
+spec=${url#git+}                  # ssh://host/path.git#ref/file
+remote=${spec%%#*}
+reffile=${spec#*#}
+if [ "$remote" = "$spec" ] || [ "${reffile%/*}" = "$reffile" ]; then
+  echo "$me: URL '$url' does not have the form git+ssh://<remote>#<ref>/<file>" >&2
+  exit 2
+fi
+ref=${reffile%/*}
+file=${reffile##*/}
+
+key= known_hosts=
+if [ -r "$conf" ]; then
+  while read -r r k h _; do
+    case "$r" in ''|'#'*) continue ;; esac
+    if [ "$r" = "$remote" ]; then key=$k known_hosts=${h:-}; break; fi
+  done < "$conf"
+fi
+if [ -z "$key" ]; then
+  echo "$me: $conf assigns no licence key to remote $remote" >&2
+  exit 2
+fi
+if [ ! -r "$key" ]; then
+  echo "$me: licence key $key for remote $remote is missing or unreadable" >&2
+  exit 2
+fi
+
+# -F none: the user's ssh config (agent keys, ControlMaster sessions opened
+# with other keys) must not decide which identity the licence check sees.
+# git runs GIT_SSH_COMMAND through a shell: quote the paths for it.
+ssh_cmd="ssh -F none -i $(printf '%q' "$key") -o IdentitiesOnly=yes -o BatchMode=yes"
+if [ -n "$known_hosts" ]; then
+  ssh_cmd+=" -o UserKnownHostsFile=$(printf '%q' "$known_hosts") -o StrictHostKeyChecking=yes"
+fi
+export GIT_SSH_COMMAND=$ssh_cmd GIT_TERMINAL_PROMPT=0
+
+repo="$cache/$(printf '%s' "$remote" | sha1sum | cut -c1-16).git"
+git_() { git --git-dir="$repo" "$@"; }
+if [ ! -d "$repo" ]; then
+  mkdir -p "$cache"
+  git init --quiet --bare "$repo"
+  git_ remote add origin "$remote"
+fi
+
+tracking="refs/git-xfer/$ref"
+fetch() {
+  if ! git_ fetch --quiet --depth=1 --no-tags origin "$ref"; then
+    echo "$me: git fetch of '$ref' from $remote failed (licence key $key)" >&2
+    exit 1
+  fi
+  local old new
+  old=$(git_ rev-parse --quiet --verify "$tracking" || true)
+  new=$(git_ rev-parse FETCH_HEAD)
+  if [ "$old" != "$new" ]; then
+    git_ update-ref "$tracking" "$new"
+    git_ reflog expire --expire=now --all
+    git_ gc --quiet --prune=now
+  fi
+}
+
+# A database download starts every sync: that is the moment to look for a new
+# release. Package downloads are served from the snapshot the database came
+# from, and fetched only if that snapshot is not here yet.
+case "$file" in
+  *.db|*.db.sig|*.files|*.files.sig) fetch ;;
+  *) git_ rev-parse --quiet --verify "$tracking" > /dev/null || fetch ;;
+esac
+
+if ! git_ cat-file -e "$tracking:$file" 2> /dev/null; then
+  # Not in this release; pacman treats a failed .sig download as "unsigned".
+  exit 1
+fi
+git_ cat-file blob "$tracking:$file" > "$out"

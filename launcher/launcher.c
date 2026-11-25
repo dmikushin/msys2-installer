@@ -11,6 +11,7 @@
 int _CRT_glob = 0;
 
 #include "macros.h"
+#include "product.h"
 
 // if any of the properties change, it's best to use a brand new AppID
 #define APPID_REVISION 9
@@ -264,7 +265,7 @@ int wmain(int argc, wchar_t* argv[]) {
 			ShowError(L"Could not allocate memory", L"", 0);
 			return __LINE__;
 		}
-		code = swprintf(buf, buflen, L"%ls\\usr\\bin\\mintty.exe -i '%ls' -o 'AppLaunchCmd=%ls' -o 'AppID=MSYS2.Shell.%ls.%d%ls' -o 'AppName=MSYS2 %ls Shell' -t 'MSYS2 %ls Shell' --store-taskbar-properties -- %ls %ls", msysdir, exepath, exepath, msystem, APPID_REVISION, msysdirhash, msystem, msystem, argc == 1 ? L"-" : L"/usr/bin/sh -lc '\"$@\"' sh", args);
+		code = swprintf(buf, buflen, L"%ls\\usr\\bin\\mintty.exe -i '%ls' -o 'AppLaunchCmd=%ls' -o 'AppID=" PRODUCT_APPID L".Shell.%ls.%d%ls' -o 'AppName=" PRODUCT_TITLE L"' -t '" PRODUCT_TITLE L"' --store-taskbar-properties -- %ls %ls", msysdir, exepath, exepath, msystem, APPID_REVISION, msysdirhash, argc == 1 ? L"-" : L"/usr/bin/sh -lc '\"$@\"' sh", args);
 		buflen *= 2;
 	}
 	if (code < 0) {

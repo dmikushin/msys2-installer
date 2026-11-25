@@ -1,0 +1,696 @@
+#!/usr/bin/env python3
+"""mkinstaller: build branded installers for products delivered as pacman
+packages into a standard MSYS2 environment.
+
+  mkinstaller build   product.toml   -> <id>-<version>-setup.exe
+  mkinstaller publish product.toml   -> release of the git+ssh update channel
+
+Runs on a Linux host. Needs: pacman (with repo-add), unshare, bsdtar, 7z, git,
+x86_64-w64-mingw32-gcc/windres and wine. See README.md for the config format.
+"""
+
+import argparse
+import datetime
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tomllib
+import urllib.request
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+MSYS2_REPOS = ("mingw32", "mingw64", "ucrt64", "clang64", "msys")
+MSYSTEMS = ("MSYS", "MINGW32", "MINGW64", "UCRT64", "CLANG64")
+# MSYS2 pacman's list of packages it updates in a transaction of their own.
+MSYS2_CORE = ("bash", "filesystem", "mintty", "msys2-runtime", "msys2-runtime-devel", "pacman", "pacman-mirrors")
+QTIFW_PACKAGE = "mingw-w64-ucrt-x86_64-qt-installer-framework"
+
+
+class Failure(Exception):
+    """A build step failed; the message names the step and the reason."""
+
+
+def log(msg):
+    print(f"[mkinstaller] {msg}", flush=True)
+
+
+def run(cmd, **kw):
+    log("$ " + " ".join(str(c) for c in cmd))
+    res = subprocess.run([str(c) for c in cmd], **kw)
+    if res.returncode != 0:
+        raise Failure(f"command {cmd[0]} exited with status {res.returncode}: {' '.join(map(str, cmd))}")
+    return res
+
+
+# --------------------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------------------
+
+class Config:
+    """product.toml, validated, with every file path resolved against the
+    directory of the config file."""
+
+    def __init__(self, path):
+        self.path = Path(path).resolve()
+        self.dir = self.path.parent
+        with open(self.path, "rb") as f:
+            raw = tomllib.load(f)
+        self.raw = raw
+
+        p = self.section("product")
+        self.id = self.need(p, "product.id")
+        if not re.fullmatch(r"[a-z][a-z0-9-]*", self.id):
+            self.fail("product.id must match [a-z][a-z0-9-]* (it names files and the pacman cache)")
+        self.name = self.need(p, "product.name")
+        self.version = self.need(p, "product.version")
+        self.publisher = self.need(p, "product.publisher")
+        self.url = p.get("url", "")
+        self.description = p.get("description", self.name)
+
+        i = self.section("install")
+        self.default_dir = i.get("default_dir", f"@RootDir@{self.name.replace(' ', '')}")
+        if " " in self.default_dir:
+            self.fail("install.default_dir must not contain spaces: MSYS2 does not support them")
+        self.start_menu_dir = i.get("start_menu_dir", self.name)
+        self.desktop_shortcut = bool(i.get("desktop_shortcut", True))
+        self.maintenance_tool = i.get("maintenance_tool", "uninstall")
+
+        t = self.section("terminal")
+        self.terminal_name = t.get("name", f"{self.name} Terminal")
+        self.launcher = t.get("launcher", self.id)
+        self.msystem = t.get("msystem", "UCRT64")
+        if self.msystem not in MSYSTEMS:
+            self.fail(f"terminal.msystem must be one of {', '.join(MSYSTEMS)}")
+        for field, value in (("terminal.name", self.terminal_name), ("product.name", self.name)):
+            if re.search(r"['\"\\/:*?<>|]", value):
+                self.fail(f"{field} must not contain quotes or characters invalid in file names")
+        self.terminal_icon = self.file(t, "icon", "terminal.icon")
+        self.welcome = t.get("welcome", "")
+
+        b = self.section("branding")
+        self.installer_icon = self.file(b, "installer_icon", "branding.installer_icon") or self.terminal_icon
+        self.window_icon = self.file(b, "window_icon", "branding.window_icon")
+        self.logo = self.file(b, "logo", "branding.logo")
+        self.watermark = self.file(b, "watermark", "branding.watermark")
+        self.banner = self.file(b, "banner", "branding.banner")
+        self.background = self.file(b, "background", "branding.background")
+        self.stylesheet = self.file(b, "stylesheet", "branding.stylesheet")
+        self.wizard_style = b.get("wizard_style", "Modern")
+        self.title_color = b.get("title_color", "")
+        self.title = b.get("title", self.name)
+        self.wizard_width = b.get("wizard_width", "")
+        self.wizard_height = b.get("wizard_height", "")
+
+        lic = self.section("license")
+        self.license_file = self.file(lic, "file", "license.file")
+        self.license_name = lic.get("name", "License Agreement")
+
+        base = self.section("base")
+        self.base_url = base.get(
+            "url", "https://repo.msys2.org/distrib/x86_64/msys2-base-x86_64-20261120.tar.zst")
+        self.base_sha256 = base.get(
+            "sha256", "adde59fcb53760bd0fd2aa3c3e8da516f03159b771dc62b77c340e4ac187fcdd")
+        self.mirrors = [m.rstrip("/") for m in base.get(
+            "mirrors", ["https://mirror.msys2.org", "https://repo.msys2.org"])]
+
+        pk = self.section("packages")
+        self.packages = list(pk.get("names", []))
+        for lst in pk.get("lists", []):
+            lp = self.dir / lst
+            if not lp.is_file():
+                self.fail(f"packages.lists names {lp}, which does not exist")
+            for line in lp.read_text().splitlines():
+                line = line.split("#", 1)[0].strip()
+                if line:
+                    self.packages.append(line)
+        if not self.packages:
+            self.fail("[packages] lists no package: give names = [...] or lists = [\"file\"]")
+
+        ch = raw.get("channel")
+        self.channel = None
+        if ch is not None:
+            c = {}
+            c["name"] = self.need(ch, "channel.name")
+            if not re.fullmatch(r"[a-z][a-z0-9_-]*", c["name"]) or c["name"] in MSYS2_REPOS:
+                self.fail("channel.name must match [a-z][a-z0-9_-]* and differ from the MSYS2 repositories")
+            c["remote"] = self.need(ch, "channel.remote")
+            if not c["remote"].startswith("ssh://"):
+                self.fail("channel.remote must be an ssh:// URL, e.g. ssh://git@github.com/acme/dist.git")
+            c["ref"] = ch.get("ref", "stable")
+            c["siglevel"] = ch.get("siglevel", "Optional TrustAll")
+            c["known_hosts"] = self.file(ch, "known_hosts", "channel.known_hosts") or HERE / "runtime/github_known_hosts"
+            c["signing_key"] = self.file(ch, "signing_key", "channel.signing_key")
+            # Build time: where mkinstaller itself takes the product packages from.
+            c["build_key"] = self.file(ch, "build_key", "channel.build_key", expand_env=True)
+            c["build_repo"] = self.file(ch, "build_repo", "channel.build_repo", kind="dir")
+            if not c["build_key"] and not c["build_repo"]:
+                self.fail("[channel] needs build_key (licence key to fetch the channel at build time) "
+                          "or build_repo (local pacman repository directory)")
+            self.channel = c
+            # pacman-git-xfer runs git over ssh on the target.
+            for tool in ("git", "openssh"):
+                if tool not in self.packages:
+                    self.packages.append(tool)
+
+        o = self.section("output")
+        self.output_dir = (self.dir / o.get("dir", "out")).resolve()
+        self.output_name = o.get("name", f"{self.id}-{self.version}-setup.exe")
+
+    def fail(self, msg):
+        raise Failure(f"{self.path}: {msg}")
+
+    def section(self, name):
+        s = self.raw.get(name, {})
+        if not isinstance(s, dict):
+            self.fail(f"[{name}] must be a table")
+        return s
+
+    def need(self, sec, dotted):
+        key = dotted.split(".")[-1]
+        if key not in sec or sec[key] in ("", None):
+            self.fail(f"{dotted} is required")
+        return sec[key]
+
+    def file(self, sec, key, dotted, kind="file", expand_env=False):
+        if key not in sec:
+            return None
+        value = sec[key]
+        if expand_env:
+            value = os.path.expandvars(os.path.expanduser(value))
+        p = (self.dir / value).resolve()
+        ok = p.is_dir() if kind == "dir" else p.is_file()
+        if not ok:
+            self.fail(f"{dotted} = {sec[key]!r}: {p} is not an existing {kind}")
+        return p
+
+    @property
+    def key_dir(self):
+        return "etc/pacman.d/git-xfer"
+
+    @property
+    def key_path(self):
+        return f"{self.key_dir}/{self.channel['name']}.key"
+
+    def server_url(self):
+        return f"git+{self.channel['remote']}#{self.channel['ref']}"
+
+
+# --------------------------------------------------------------------------
+# Host-side pacman against MSYS2 repositories
+# --------------------------------------------------------------------------
+
+def fetch(url, dest, sha256=None):
+    if not dest.exists():
+        log(f"downloading {url}")
+        tmp = dest.with_suffix(dest.suffix + ".part")
+        with urllib.request.urlopen(url) as r, open(tmp, "wb") as f:
+            shutil.copyfileobj(r, f)
+        tmp.rename(dest)
+    if sha256:
+        h = hashlib.sha256(dest.read_bytes()).hexdigest()
+        if h != sha256:
+            raise Failure(f"{dest} has sha256 {h}, the config pins {sha256}")
+
+
+class HostPacman:
+    """The host's pacman, run in a user namespace as fake root, operating on a
+    separate database directory with the MSYS2 keyring. It only resolves and
+    downloads; installation happens on the target with the target's pacman."""
+
+    def __init__(self, work, cfg, keyrings_dir):
+        self.work = work
+        self.cfg = cfg
+        self.gpgdir = work / "gnupg"
+        self.conf = work / "pacman.conf"
+        self.xfer_conf = work / "git-xfer.conf"
+        self.write_conf()
+        self.init_keyring(keyrings_dir)
+
+    def write_conf(self):
+        cfg = self.cfg
+        lines = ["[options]", "Architecture = x86_64", "SigLevel = Required DatabaseOptional",
+                 "LocalFileSigLevel = Optional", "DisableSandbox"]
+        if cfg.channel and not cfg.channel["build_repo"]:
+            lines.append(f"XferCommand = /usr/bin/bash {HERE / 'runtime/pacman-git-xfer'} %o %u")
+        lines.append("")
+        if cfg.channel:
+            ch = cfg.channel
+            server = (f"file://{ch['build_repo']}" if ch["build_repo"] else cfg.server_url())
+            lines += [f"[{ch['name']}]", f"SigLevel = {ch['siglevel']}", f"Server = {server}", ""]
+            if not ch["build_repo"]:
+                self.xfer_conf.write_text(f"{ch['remote']} {ch['build_key']} {ch['known_hosts']}\n")
+        for repo in MSYS2_REPOS:
+            path = "msys/$arch" if repo == "msys" else f"mingw/{repo}"
+            lines += [f"[{repo}]"] + [f"Server = {m}/{path}/" for m in cfg.mirrors] + [""]
+        self.conf.write_text("\n".join(lines))
+
+    def init_keyring(self, keyrings_dir):
+        if self.gpgdir.exists():
+            shutil.rmtree(self.gpgdir)
+        self.gpgdir.mkdir()
+        quiet = dict(stdout=subprocess.DEVNULL)
+        run(["unshare", "-r", "pacman-key", "--gpgdir", self.gpgdir, "--init"], **quiet)
+        run(["unshare", "-r", "pacman-key", "--gpgdir", self.gpgdir, "--populate-from", keyrings_dir,
+             "--populate"] + sorted(p.stem for p in Path(keyrings_dir).glob("*.gpg")), **quiet)
+
+    def __call__(self, dbpath, cachedir, args, capture=False):
+        env = dict(os.environ,
+                   PACMAN_GIT_XFER_CONF=str(self.xfer_conf),
+                   PACMAN_GIT_XFER_CACHE=str(self.work / "git-xfer-cache"))
+        res = run(["unshare", "-r", "pacman", "--config", self.conf, "--root", self.work / "root",
+                   "--dbpath", dbpath, "--gpgdir", self.gpgdir, "--cachedir", cachedir,
+                   "--logfile", self.work / "pacman.log", "--noconfirm", "--noprogressbar"] + args,
+                  env=env, stdout=subprocess.PIPE if capture else None, text=True)
+        return res.stdout
+
+
+# --------------------------------------------------------------------------
+# Build
+# --------------------------------------------------------------------------
+
+class Builder:
+    def __init__(self, cfg, work, cache, wine):
+        self.cfg = cfg
+        self.work = work
+        self.cache = cache
+        self.wine = wine
+        self.stage = work / "stage" / "msys64"
+
+    def build(self):
+        cfg = self.cfg
+        self.work.mkdir(parents=True, exist_ok=True)
+        self.cache.mkdir(parents=True, exist_ok=True)
+        (self.work / "root").mkdir(exist_ok=True)
+
+        self.unpack_base()
+        keyrings = self.work / "keyrings"
+        if keyrings.exists():
+            shutil.rmtree(keyrings)
+        shutil.copytree(self.stage / "usr/share/pacman/keyrings", keyrings)
+        if cfg.channel and cfg.channel["signing_key"]:
+            self.add_signing_keyring(keyrings)
+        self.pacman = HostPacman(self.work, cfg, keyrings)
+
+        bundle = self.download_bundle()
+        self.customise_stage(bundle, keyrings)
+        self.build_launcher()
+        ifw = self.make_ifw_tree()
+        return self.binarycreator(ifw)
+
+    def unpack_base(self):
+        name = self.cfg.base_url.rsplit("/", 1)[1]
+        tarball = self.cache / name
+        fetch(self.cfg.base_url, tarball, self.cfg.base_sha256)
+        stage_root = self.stage.parent
+        if stage_root.exists():
+            shutil.rmtree(stage_root)
+        stage_root.mkdir(parents=True)
+        run(["bsdtar", "-xf", tarball, "-C", stage_root])
+        if not (self.stage / "usr/bin/msys-2.0.dll").is_file():
+            raise Failure(f"{tarball} did not unpack into msys64/ with an MSYS2 runtime")
+
+    def add_signing_keyring(self, keyrings):
+        """Turn the product's armored public key into a pacman keyring
+        (<id>.gpg + <id>-trusted), as msys2-keyring does for MSYS2's keys."""
+        key = self.cfg.channel["signing_key"]
+        out = subprocess.run(["gpg", "--show-keys", "--with-colons", "--with-fingerprint", key],
+                             capture_output=True, text=True, check=True).stdout
+        fprs = [l.split(":")[9] for l in out.splitlines() if l.startswith("fpr:")]
+        if not fprs:
+            raise Failure(f"channel.signing_key {key}: gpg found no key in it")
+        shutil.copy(key, keyrings / f"{self.cfg.id}.gpg")
+        (keyrings / f"{self.cfg.id}-trusted").write_text(f"{fprs[0]}:4:\n")
+
+    def download_bundle(self):
+        """Resolve the product packages and their dependencies against the
+        base's local database and download them (pacman -Sw)."""
+        cfg = self.cfg
+        dbpath = self.work / "db"
+        if dbpath.exists():
+            shutil.rmtree(dbpath)
+        shutil.copytree(self.stage / "var/lib/pacman", dbpath)
+        # Downloads go to a cache shared between builds; the transaction's own
+        # file list (-Sp) decides what goes into this installer.
+        pkgcache = self.cache / "pkg"
+        pkgcache.mkdir(parents=True, exist_ok=True)
+        self.pacman(dbpath, pkgcache, ["-Syw", "--needed"] + cfg.packages)
+        out = self.pacman(dbpath, pkgcache, ["-Sp", "--needed", "--print-format", "%n %f"] + cfg.packages,
+                          capture=True)
+        plan = [l.split() for l in out.splitlines() if l.strip()]
+        if not plan:
+            raise Failure("pacman -Sp lists no package: every requested package is already in the base")
+        # firstrun.sh installs the bundle with the target's pacman, run from bash.
+        # A transaction that replaces pacman, bash or the MSYS2 runtime breaks
+        # the fork() of its own hooks (reproduced: tests/wine/README.md), which
+        # is why MSYS2 updates these "core" packages alone. Keep them out.
+        core = sorted(n for n, _ in plan if n in MSYS2_CORE or n.startswith("msys2-runtime"))
+        if core:
+            raise Failure(f"the packages need newer MSYS2 core packages than {self.cfg.base_url} has: "
+                          f"{', '.join(core)}; set [base] url/sha256 to a newer base archive")
+        files = [f for _, f in plan]
+        bundle = self.work / "bundle"
+        if bundle.exists():
+            shutil.rmtree(bundle)
+        bundle.mkdir()
+        for f in files:
+            src = pkgcache / f
+            if not src.is_file():
+                raise Failure(f"pacman -Sw did not leave {f} in {pkgcache}")
+            shutil.copy2(src, bundle / f)
+            sig = pkgcache / (f + ".sig")
+            if sig.is_file():
+                shutil.copy2(sig, bundle / sig.name)
+        log(f"bundle: {len(files)} package files")
+        return bundle
+
+    def customise_stage(self, bundle, keyrings):
+        cfg, s = self.cfg, self.stage
+        pkgcache = s / "var/cache/pacman/pkg"
+        pkgcache.mkdir(parents=True, exist_ok=True)
+        names = []
+        for p in sorted(bundle.iterdir()):
+            if p.is_file() and not p.name.endswith(".part"):
+                shutil.copy2(p, pkgcache / p.name)
+                if not p.name.endswith(".sig"):
+                    names.append(p.name)
+
+        share = s / "usr/share" / cfg.id
+        share.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(HERE / "runtime/firstrun.sh", share / "firstrun.sh")
+        (share / "bundle.txt").write_text("".join(n + "\n" for n in names))
+        (share / "explicit.txt").write_text("".join(n + "\n" for n in cfg.packages))
+
+        if cfg.channel and cfg.channel["signing_key"]:
+            for f in (f"{cfg.id}.gpg", f"{cfg.id}-trusted"):
+                shutil.copy2(keyrings / f, s / "usr/share/pacman/keyrings" / f)
+            # 07-pacman-key.post populates msys2 only; this one adds the product key.
+            (s / f"etc/post-install/08-{cfg.id}-key.post").write_text(
+                f"[ -d /etc/pacman.d/gnupg ] && /usr/bin/pacman-key --populate {cfg.id} || true\n")
+
+        if cfg.channel:
+            self.add_channel(s)
+        self.add_profile(s)
+
+    def add_channel(self, s):
+        cfg, ch = self.cfg, self.cfg.channel
+        conf = s / "etc/pacman.conf"
+        text = conf.read_text()
+        text, n = re.subn(r"^\[options\]\n",
+                          "[options]\nXferCommand = /usr/bin/bash /usr/bin/pacman-git-xfer %o %u\n",
+                          text, count=1, flags=re.M)
+        if n != 1:
+            raise Failure(f"{conf}: no [options] section to add XferCommand to")
+        section = (f"[{ch['name']}]\nSigLevel = {ch['siglevel']}\nServer = {cfg.server_url()}\n\n")
+        # Before the first repository, so the product's packages take precedence.
+        m = re.search(r"^\[(?!options\])[^\]]+\]", text, flags=re.M)
+        if not m:
+            raise Failure(f"{conf}: no repository section found")
+        text = text[:m.start()] + section + text[m.start():]
+        conf.write_text(text)
+
+        shutil.copy2(HERE / "runtime/pacman-git-xfer", s / "usr/bin/pacman-git-xfer")
+        keydir = s / cfg.key_dir
+        keydir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ch["known_hosts"], keydir / "known_hosts")
+        (s / "etc/pacman.d/git-xfer.conf").write_text(
+            "# <remote> <licence key> <known_hosts>, read by /usr/bin/pacman-git-xfer\n"
+            f"{ch['remote']} /{cfg.key_path} /{cfg.key_dir}/known_hosts\n")
+
+    def add_profile(self, s):
+        cfg = self.cfg
+        welcome = cfg.welcome.replace("'", "'\\''")
+        # /etc/bash.bashrc takes MSYS2_PS1 as the prompt; the title escape
+        # names the product instead of showing only the directory.
+        (s / f"etc/profile.d/zz-{cfg.id}.sh").write_text(f"""\
+# {cfg.name}: branding of the product terminal ({cfg.launcher}.ini sets MSYS2_PRODUCT).
+if [ "$MSYS2_PRODUCT" = "{cfg.id}" ]; then
+  MSYS2_PS1='\\[\\e]0;{cfg.terminal_name}: \\w\\a\\]\\n\\[\\e[32m\\]\\u@\\h \\[\\e[35m\\]{cfg.name}\\[\\e[0m\\] \\[\\e[33m\\]\\w\\[\\e[0m\\]\\n\\$ '
+  if [ -n '{welcome}' ] && [ -t 1 ]; then printf '%s\\n' '{welcome}'; fi
+fi
+""")
+
+    def build_launcher(self):
+        cfg, s = self.cfg, self.stage
+        src = HERE / "launcher"
+        lw = self.work / "launcher"
+        if lw.exists():
+            shutil.rmtree(lw)
+        shutil.copytree(src, lw)
+        icon = cfg.terminal_icon or (s / f"{cfg.msystem.lower() if cfg.msystem != 'MSYS' else 'msys2'}.ico")
+        shutil.copy2(icon, lw / "launcher.ico")
+
+        def c_str(v):
+            return json.dumps(v)  # a valid C string literal for printable text
+        (lw / "product.h").write_text(
+            "#ifndef PRODUCT_H\n#define PRODUCT_H\n"
+            f"#define PRODUCT_APPID L{c_str(cfg.id)}\n"
+            f"#define PRODUCT_TITLE L{c_str(cfg.terminal_name)}\n"
+            f"#define PRODUCT_NAME_A {c_str(cfg.name)}\n"
+            f"#define PRODUCT_TITLE_A {c_str(cfg.terminal_name)}\n"
+            "#endif\n")
+        run(["x86_64-w64-mingw32-windres", "-O", "COFF", "-o", lw / "launcher.res", lw / "launcher.rc"], cwd=lw)
+        exe = s / f"{cfg.launcher}.exe"
+        run(["x86_64-w64-mingw32-gcc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-static", "-municode",
+             "-mwindows", "-o", exe, lw / "launcher.c", lw / "launcher.res"], cwd=lw)
+        shutil.copy2(icon, s / f"{cfg.launcher}.ico")
+        ini = (src / "launcher.ini").read_text()
+        (s / f"{cfg.launcher}.ini").write_text(ini + f"MSYSTEM={cfg.msystem}\nMSYS2_PRODUCT={cfg.id}\n")
+
+    def make_ifw_tree(self):
+        cfg = self.cfg
+        ifw = self.work / "qt-ifw"
+        if ifw.exists():
+            shutil.rmtree(ifw)
+        shutil.copytree(HERE / "qt-ifw", ifw)
+        config_dir = ifw / "config"
+        meta = ifw / "packages/com.msys2.root/meta"
+        data = ifw / "packages/com.msys2.root/data"
+        data.mkdir(parents=True)
+
+        run(["7z", "a", "-bd", "-mx9", "-md128m", "-mmt=on", data / "msys64.7z", "."],
+            cwd=self.stage, stdout=subprocess.DEVNULL)
+
+        (config_dir / "msys2.ico").unlink()
+        tree = ET.parse(config_dir / "config.xml")
+        root = tree.getroot()
+
+        def put(tag, value):
+            if value in (None, ""):
+                el = root.find(tag)
+                if el is not None:
+                    root.remove(el)
+                return
+            el = root.find(tag)
+            if el is None:
+                el = ET.SubElement(root, tag)
+            el.text = str(value)
+
+        def asset(path, stem):
+            if path is None:
+                return None
+            name = stem + path.suffix
+            shutil.copy2(path, config_dir / name)
+            return name
+
+        icon = cfg.installer_icon or (self.stage / "ucrt64.ico")
+        shutil.copy2(icon, config_dir / "installer.ico")
+        put("Name", cfg.name)
+        put("Version", cfg.version)
+        put("Title", cfg.title)
+        put("Publisher", cfg.publisher)
+        put("ProductUrl", cfg.url)
+        put("StartMenuDir", cfg.start_menu_dir)
+        put("TargetDir", cfg.default_dir)
+        put("RunProgram", f"@TargetDir@/{cfg.launcher}.exe")
+        put("InstallerApplicationIcon", "installer")
+        put("InstallerWindowIcon", asset(cfg.window_icon, "window") or "installer.ico")
+        put("Logo", asset(cfg.logo, "logo"))
+        put("Watermark", asset(cfg.watermark, "watermark"))
+        put("Banner", asset(cfg.banner, "banner"))
+        put("Background", asset(cfg.background, "background"))
+        put("StyleSheet", asset(cfg.stylesheet, "style"))
+        put("WizardStyle", cfg.wizard_style)
+        put("TitleColor", cfg.title_color)
+        put("WizardDefaultWidth", cfg.wizard_width or "40em")
+        put("WizardDefaultHeight", cfg.wizard_height)
+        put("MaintenanceToolName", cfg.maintenance_tool)
+        ET.indent(tree)
+        tree.write(config_dir / "config.xml", encoding="UTF-8", xml_declaration=True)
+
+        control = config_dir / "control.js"
+        control.write_text(control.read_text().replace("@HAS_LICENSE@", "true" if cfg.license_file else "false"))
+
+        pkg = ET.parse(meta / "package.xml")
+        proot = pkg.getroot()
+        proot.find("DisplayName").text = cfg.name
+        proot.find("Description").text = cfg.description
+        proot.find("Version").text = cfg.version
+        proot.find("ReleaseDate").text = datetime.date.today().isoformat()
+        if cfg.license_file:
+            shutil.copy2(cfg.license_file, meta / "license.txt")
+            lic = ET.SubElement(ET.SubElement(proot, "Licenses"), "License")
+            lic.set("name", cfg.license_name)
+            lic.set("file", "license.txt")
+        if cfg.channel:
+            ui = ET.SubElement(proot, "UserInterfaces")
+            ET.SubElement(ui, "UserInterface").text = "licensekeypage.ui"
+        else:
+            (meta / "licensekeypage.ui").unlink()
+        ET.indent(pkg)
+        pkg.write(meta / "package.xml", encoding="UTF-8", xml_declaration=True)
+
+        product = {
+            "id": cfg.id,
+            "launcher": cfg.launcher,
+            "terminalName": cfg.terminal_name,
+            "desktopShortcut": cfg.desktop_shortcut,
+            "firstRun": f"/usr/share/{cfg.id}/firstrun.sh",
+            "channel": None,
+        }
+        if cfg.channel:
+            product["channel"] = {"remote": cfg.channel["remote"], "keyDir": cfg.key_dir, "keyPath": cfg.key_path}
+        script = meta / "installscript.js"
+        script.write_text(script.read_text().replace("@PRODUCT_JSON@", json.dumps(product, indent=4)))
+        return ifw
+
+    def qtifw(self):
+        """installerbase.exe and binarycreator.exe from MSYS2's
+        qt-installer-framework package (static builds, no DLLs needed)."""
+        tools = self.cache / "qtifw"
+        if not (tools / "ucrt64/bin/binarycreator.exe").is_file():
+            dl = self.work / "qtifw-dl"
+            db = self.work / "qtifw-db"
+            for d in (dl, db):
+                if d.exists():
+                    shutil.rmtree(d)
+                d.mkdir()
+            (db / "local").mkdir()
+            (db / "local/ALPM_DB_VERSION").write_text("9\n")
+            self.pacman(db, dl, ["-Syw", QTIFW_PACKAGE])
+            pkgfile = next(dl.glob(f"{QTIFW_PACKAGE}-*.pkg.tar.zst"))
+            tools.mkdir(parents=True, exist_ok=True)
+            run(["bsdtar", "-xf", pkgfile, "-C", tools, "ucrt64/bin/binarycreator.exe",
+                 "ucrt64/bin/installerbase.exe"])
+        return tools / "ucrt64/bin"
+
+    def binarycreator(self, ifw):
+        cfg = self.cfg
+        bindir = self.qtifw()
+        cfg.output_dir.mkdir(parents=True, exist_ok=True)
+        out = cfg.output_dir / cfg.output_name
+        if out.exists():
+            out.unlink()
+
+        def w(p):
+            return "Z:" + str(p).replace("/", "\\")
+        env = dict(os.environ, WINEPREFIX=str(self.cache / "wineprefix"), WINEDEBUG="-all")
+        run([self.wine, bindir / "binarycreator.exe", "-t", w(bindir / "installerbase.exe"),
+             "-p", w(ifw / "packages"), "-c", w(ifw / "config/config.xml"), "--offline-only", w(out)],
+            env=env, stdout=subprocess.DEVNULL)
+        if not out.is_file():
+            raise Failure(f"binarycreator.exe reported success but {out} does not exist")
+        log(f"installer: {out}")
+        return out
+
+
+# --------------------------------------------------------------------------
+# Publish a release to the git+ssh channel
+# --------------------------------------------------------------------------
+
+def publish(cfg, packages_dir, release, work, push_key=None, known_hosts=None):
+    """Make a pacman repository of every package in packages_dir, commit it as
+    a parentless commit tagged <release>, and point the channel ref at it."""
+    if not cfg.channel:
+        raise Failure(f"{cfg.path} has no [channel]")
+    ch = cfg.channel
+    pkgs = sorted(p for p in Path(packages_dir).iterdir() if p.name.endswith((".pkg.tar.zst", ".pkg.tar.xz")))
+    if not pkgs:
+        raise Failure(f"{packages_dir} holds no *.pkg.tar.zst")
+    tree = work / "publish-tree"
+    if tree.exists():
+        shutil.rmtree(tree)
+    tree.mkdir(parents=True)
+    for p in pkgs:
+        shutil.copy2(p, tree / p.name)
+        sig = p.with_name(p.name + ".sig")
+        if sig.exists():
+            shutil.copy2(sig, tree / sig.name)
+    run(["repo-add", "--quiet", "--nocolor", tree / f"{ch['name']}.db.tar.gz"] + [tree / p.name for p in pkgs])
+    # git stores symlinks as links; pacman must receive the databases themselves.
+    for kind in ("db", "files"):
+        link = tree / f"{ch['name']}.{kind}"
+        target = tree / f"{ch['name']}.{kind}.tar.gz"
+        link.unlink()
+        shutil.move(target, link)
+        old = tree / f"{ch['name']}.{kind}.tar.gz.old"
+        if old.exists():
+            old.unlink()
+
+    gitdir = work / "publish.git"
+    env = dict(os.environ)
+    if push_key:
+        # git runs GIT_SSH_COMMAND through a shell: quote the paths for it.
+        ssh = f"ssh -F none -i {shlex.quote(push_key)} -o IdentitiesOnly=yes -o BatchMode=yes"
+        if known_hosts:
+            ssh += f" -o UserKnownHostsFile={shlex.quote(known_hosts)} -o StrictHostKeyChecking=yes"
+        env["GIT_SSH_COMMAND"] = ssh
+    if not gitdir.exists():
+        run(["git", "init", "--quiet", "--bare", gitdir])
+    git = ["git", "--git-dir", gitdir, "--work-tree", tree]
+    index = work / "publish.index"
+    if index.exists():
+        index.unlink()
+    env["GIT_INDEX_FILE"] = str(index)
+    run(git + ["add", "--all", "."], env=env)
+    treeid = subprocess.run(git + ["write-tree"], env=env, capture_output=True, text=True, check=True).stdout.strip()
+    ident = {"GIT_AUTHOR_NAME": cfg.publisher, "GIT_AUTHOR_EMAIL": "release@" + cfg.id,
+             "GIT_COMMITTER_NAME": cfg.publisher, "GIT_COMMITTER_EMAIL": "release@" + cfg.id}
+    commit = subprocess.run(git + ["commit-tree", treeid, "-m", f"{cfg.name} {release}"],
+                            env=dict(env, **ident), capture_output=True, text=True, check=True).stdout.strip()
+    run(git + ["tag", "-f", release, commit], env=env)
+    run(git + ["push", "--force", ch["remote"], f"{commit}:refs/heads/{ch['ref']}",
+               f"+refs/tags/{release}:refs/tags/{release}"], env=env)
+    log(f"published {release} = {commit[:12]} to {ch['remote']} ref {ch['ref']}")
+    return commit
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    b = sub.add_parser("build", help="build the installer")
+    b.add_argument("config")
+    b.add_argument("--work", help="work directory (default: <config dir>/_build)")
+    b.add_argument("--cache", default=os.path.expanduser("~/.cache/mkinstaller"),
+                   help="download cache shared between builds")
+    b.add_argument("--wine", default="wine", help="wine binary that runs binarycreator.exe")
+    p = sub.add_parser("publish", help="publish packages as a release of the update channel")
+    p.add_argument("config")
+    p.add_argument("packages_dir")
+    p.add_argument("release", help="release tag, e.g. v1.0.1")
+    p.add_argument("--work", help="work directory (default: <config dir>/_build)")
+    p.add_argument("--push-key", help="SSH key with write access to the channel remote "
+                   "(default: the publisher's own ssh setup)")
+    p.add_argument("--known-hosts", help="known_hosts file for --push-key")
+    args = ap.parse_args()
+
+    try:
+        cfg = Config(args.config)
+        work = Path(args.work).resolve() if args.work else cfg.dir / "_build"
+        if args.cmd == "build":
+            Builder(cfg, work, Path(args.cache), args.wine).build()
+        else:
+            work.mkdir(parents=True, exist_ok=True)
+            publish(cfg, args.packages_dir, args.release, work, args.push_key, args.known_hosts)
+    except Failure as e:
+        print(f"mkinstaller: error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,3 +1,6 @@
+// Generated product settings (mkinstaller fills this in).
+var PRODUCT = @PRODUCT_JSON@;
+
 function cancelInstaller(message)
 {
     installer.setDefaultPageVisible(QInstaller.Introduction, false);
@@ -26,6 +29,20 @@ function isSupported()
     return false;
 }
 
+// The licence key file: given on the command line as LicenseKeyFile=<path>,
+// or chosen on the "Licence key" page of the GUI.
+function licenseKeyFile()
+{
+    var key = installer.value("LicenseKeyFile", "");
+    if (key === "" && PRODUCT.channel && installer.isInstaller()) {
+        var page = gui.pageWidgetByObjectName("DynamicLicenseKeyPage");
+        if (page != null) {
+            key = page.keyPath.text;
+        }
+    }
+    return key;
+}
+
 function createShortcuts()
 {
     var windir = installer.environmentVariable("WINDIR");
@@ -34,14 +51,37 @@ function createShortcuts()
         return;
     }
 
-    component.addOperation("CreateShortcut", "@TargetDir@/mingw64.exe", "@StartMenuDir@/MSYS2 MINGW64.lnk", "iconPath=@TargetDir@/mingw64.exe");
-    component.addOperation("CreateShortcut", "@TargetDir@/ucrt64.exe", "@StartMenuDir@/MSYS2 UCRT64.lnk", "iconPath=@TargetDir@/ucrt64.exe");
-    component.addOperation("CreateShortcut", "@TargetDir@/clang64.exe", "@StartMenuDir@/MSYS2 CLANG64.lnk", "iconPath=@TargetDir@/clang64.exe");
-    component.addOperation("CreateShortcut", "@TargetDir@/clangarm64.exe", "@StartMenuDir@/MSYS2 CLANGARM64.lnk", "iconPath=@TargetDir@/clangarm64.exe");
-    component.addOperation("CreateShortcut", "@TargetDir@/msys2.exe", "@StartMenuDir@/MSYS2 MSYS.lnk", "iconPath=@TargetDir@/msys2.exe");
+    var launcher = "@TargetDir@/" + PRODUCT.launcher + ".exe";
+    var icon = "iconPath=@TargetDir@/" + PRODUCT.launcher + ".ico";
+    component.addOperation("CreateShortcut", launcher, "@StartMenuDir@/" + PRODUCT.terminalName + ".lnk", icon);
+    if (PRODUCT.desktopShortcut) {
+        component.addOperation("CreateShortcut", launcher, "@DesktopDir@/" + PRODUCT.terminalName + ".lnk", icon);
+    }
+}
 
-    component.addOperation( "Execute",
+function installLicenseKey()
+{
+    if (!PRODUCT.channel) {
+        return;
+    }
+    var key = licenseKeyFile();
+    if (key === "") {
+        console.log("No licence key given: updates from " + PRODUCT.channel.remote + " stay disabled until " +
+                    PRODUCT.channel.keyPath + " is installed.");
+        return;
+    }
+    component.addOperation("Mkdir", "@TargetDir@/" + PRODUCT.channel.keyDir);
+    component.addOperation("Copy", key, "@TargetDir@/" + PRODUCT.channel.keyPath);
+}
+
+function firstRun()
+{
+    // First login shell: /etc/post-install initialises the pacman keyring.
+    component.addOperation("Execute",
                            ["@TargetDir@\\usr\\bin\\bash.exe", "--login", "-c", "exit"]);
+    // Install the bundled product packages with the target's own pacman.
+    component.addOperation("Execute",
+                           ["@TargetDir@\\usr\\bin\\bash.exe", "--login", "-c", PRODUCT.firstRun]);
 }
 
 function Component() {
@@ -51,18 +91,27 @@ function Component() {
         return;
     }
 
-    var systemDrive = installer.environmentVariable("SystemDrive");
-    // Use C: as a default for messed up systems.
-    if (systemDrive === "") {
-        systemDrive = "C:";
-    }
-    var targetDir = installer.value("TargetDir", systemDrive+"\\msys64")
+    // Names the Windows "Apps & features" entry; must not collide with other products.
+    installer.setValue("ProductUUID", PRODUCT.id);
 
-    installer.setValue("TargetDir", targetDir);
+    if (PRODUCT.channel && installer.isInstaller()) {
+        installer.addWizardPage(component, "LicenseKeyPage", QInstaller.StartMenuSelection);
+        var page = gui.pageWidgetByObjectName("DynamicLicenseKeyPage");
+        if (page != null) {
+            page.browseButton.clicked.connect(function() {
+                var path = QFileDialog.getOpenFileName("Licence key", page.keyPath.text, "*");
+                if (path !== "") {
+                    page.keyPath.text = path;
+                }
+            });
+        }
+    }
 }
 
 Component.prototype.createOperations = function()
 {
     component.createOperations();
+    installLicenseKey();
     createShortcuts();
+    firstRun();
 }

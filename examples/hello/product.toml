@@ -1,0 +1,55 @@
+# mkinstaller example: "Acme Hello", a product delivered as the pacman package
+# acme-hello into its own MSYS2 environment, updated from a GitHub repository.
+# Paths are relative to this file.
+
+[product]
+id = "acme-hello"                 # names files, the launcher and the pacman cache entries
+name = "Acme Hello"
+version = "1.0.0"
+publisher = "Acme Corp"
+url = "https://example.com/acme-hello"
+description = "Acme Hello command line tools"
+
+[install]
+default_dir = "@RootDir@AcmeHello"       # Qt IFW variables allowed; no spaces: MSYS2 does not support them
+start_menu_dir = "Acme Hello"
+desktop_shortcut = true
+
+[terminal]
+name = "Acme Hello Terminal"      # shortcut and window title
+launcher = "acme-hello"           # -> acme-hello.exe, acme-hello.ini, acme-hello.ico
+msystem = "UCRT64"
+icon = "assets/acme.ico"
+welcome = "Welcome to Acme Hello. Run 'acme-hello' to start."
+
+[branding]                        # Qt Installer Framework skin
+installer_icon = "assets/acme.ico"
+logo = "assets/logo.png"
+watermark = "assets/watermark.png"
+banner = "assets/banner.png"
+wizard_style = "Modern"
+title_color = "#ffffff"
+
+[license]
+file = "LICENSE.txt"
+name = "Acme Hello EULA"
+
+[base]                            # official MSYS2 base archive the environment starts from
+url = "https://repo.msys2.org/distrib/x86_64/msys2-base-x86_64-20261120.tar.zst"
+sha256 = "adde59fcb53760bd0fd2aa3c3e8da516f03159b771dc62b77c340e4ac187fcdd"
+
+[packages]
+lists = ["packages.txt"]
+
+[channel]                         # updates: pacman repository published as a git ref
+name = "acme"                     # pacman repository name
+remote = "ssh://git@github.com/acme/hello-dist.git"
+ref = "stable"                    # branch the releases are published to
+siglevel = "Optional TrustAll"
+# known_hosts = "known_hosts"     # default: GitHub's host keys
+# signing_key = "keys/acme.asc"   # armored public key, if packages are signed
+build_key = "${ACME_BUILD_KEY}"   # key the build uses to fetch the channel
+# build_repo = "repo"             # alternative: local pacman repository directory
+
+[output]
+dir = "out"

@@ -1,0 +1,8 @@
+# Proves the scriptlet ran natively on the target.
+post_install() {
+  echo "$1" > /etc/acme-hello.scriptlet
+}
+
+post_upgrade() {
+  echo "$1" > /etc/acme-hello.scriptlet
+}
